@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   confirm-conversation:
-    if: ${{ github.event.pull_request.base.ref == 'master' && (github.event.action != 'edited' || github.event.changes.base.ref.from != null) }}
+    if: ${{ github.event.pull_request.base.ref == 'master' && github.event.changes.base.ref.from != null }}
     runs-on: ubuntu-latest
 
     steps:
