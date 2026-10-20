@@ -56,6 +56,7 @@ jobs:
                 pullRequest(number: $number) {
                   reviewThreads(last: 100) {
                     nodes {
+                      id
                       isResolved
                       comments(first: 1) {
                         nodes { body }
@@ -66,7 +67,7 @@ jobs:
               }
             }' -f owner="${OWNER}" -f repo="${REPO_NAME}" -F number="${PR_NUMBER}")"
 
-          GUARD_STATE="$(echo "${THREADS_JSON}" | python3 -c "
+          GUARD_RESULT="$(echo "${THREADS_JSON}" | python3 -c "
           import json, sys
           data = json.load(sys.stdin)
           marker = '${MARKER}'
@@ -74,24 +75,42 @@ jobs:
           for node in data['data']['repository']['pullRequest']['reviewThreads']['nodes']:
               comments = node.get('comments', {}).get('nodes', [])
               if comments and comments[0].get('body', '').startswith(marker):
-                  states.append(node['isResolved'])
-          print('open' if False in states else 'resolved' if states else 'none')
+                  states.append((node['isResolved'], node['id']))
+          if any(not resolved for resolved, _ in states):
+              print('open')
+          elif states:
+              print('resolved', states[-1][1])
+          else:
+              print('none')
           ")"
+          read -r GUARD_STATE GUARD_THREAD_ID <<< "${GUARD_RESULT}"
 
           if [ "${GUARD_STATE}" = "open" ]; then
             echo "Confirmation conversation is already unresolved -- nothing to do."
             exit 0
           fi
 
-          # github.token cannot unresolve review threads, so re-locking means a new conversation.
+          # Re-lock by unresolving the latest confirmation conversation. If that is refused,
+          # fall back to a new conversation so master is never left unguarded.
           if [ "${GUARD_STATE}" = "resolved" ]; then
-            echo "Previous confirmation was resolved -- opening a new one for the new changes."
+            echo "Previous confirmation was resolved -- re-opening it for the new changes."
+            if IS_RESOLVED="$(gh api graphql -f query='
+              mutation($threadId: ID!) {
+                unresolveReviewThread(input: {threadId: $threadId}) {
+                  thread { isResolved }
+                }
+              }' -f threadId="${GUARD_THREAD_ID}" --jq '.data.unresolveReviewThread.thread.isResolved')" \
+              && [ "${IS_RESOLVED}" = "false" ]; then
+              echo "Re-opened confirmation conversation ${GUARD_THREAD_ID}."
+              exit 0
+            fi
+            echo "::warning::Could not re-open confirmation conversation ${GUARD_THREAD_ID}; opening a new one instead."
           else
             echo "No existing conversation found; creating one."
           fi
 
           BODY="${MARKER}
-          Do you really want to merge into \`master\`? Merging into \`master\` triggers a **production deployment** (see deploy.yml). Resolve this conversation once you've confirmed -- pushing new commits will open a new one. If this isn't intentional, re-target this PR to \`qa\`, \`staging\`, or \`testing\` instead."
+          Do you really want to merge into \`master\`? Merging into \`master\` triggers a **production deployment** (see deploy.yml). Resolve this conversation once you've confirmed -- pushing new commits will re-open it. If this isn't intentional, re-target this PR to \`qa\`, \`staging\`, or \`testing\` instead."
 
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate > /tmp/pr_files.json
 
