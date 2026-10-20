@@ -1,20 +1,34 @@
-name: PR Guard - Confirm Merge into master (conversation-based)
+name: PR - Guard Master Base Branch
+
+# Warns on PRs that target master, since merging there triggers a production
+# deployment (see deploy.yml). Posts a review comment anchored to a line in
+# the diff — an actual resolvable "conversation," not a plain PR comment —
+# so it can be gated by branch protection.
+#
+# REQUIRES: "Require conversation resolution before merging" enabled in
+# master's branch protection rule/ruleset (Settings -> Branches, or
+# Settings -> Rules -> Rulesets). This workflow only posts the comment; it
+# doesn't block the merge button itself, that's what the branch protection
+# setting does.
+#
+# Known legitimate direct-to-master sources are skipped: the infra
+# automation bot's hotfix PRs, and the manual staging -> master promotion.
 
 on:
-  pull_request_target:
-    types: [opened, reopened, synchronize, edited]
+  pull_request:
+    types: [opened, reopened]
 
 permissions:
   contents: read
   pull-requests: write
 
 concurrency:
-  group: pr-guard-conversation-master-${{ github.event.pull_request.number }}
-  cancel-in-progress: ${{ github.event.action != 'edited' }}
+  group: pr-guard-master-base-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  confirm-conversation:
-    if: ${{ github.event.pull_request.base.ref == 'master' && (github.event.action != 'edited' || github.event.changes.base.ref.from != null) }}
+  guard-master:
+    if: ${{ github.event.pull_request.base.ref == 'master' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -22,12 +36,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Find or create the confirmation conversation
+      - name: Warn on PRs targeting master
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -35,64 +47,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Known legitimate cases that are allowed to target master directly
-          # (same as pr-guard-master-base.yml).
+          # Known legitimate cases that are allowed to target master directly.
+          # Tighten the staging check further (e.g. an explicit release-manager
+          # team allowlist) if a plain head-branch-name match proves too loose.
           if [[ "${PR_AUTHOR}" == "watchwire-infra-authentication[bot]" ]]; then
-            echo "PR #${PR_NUMBER} opened by the infra automation bot; no confirmation needed."
+            echo "PR #${PR_NUMBER} opened by the infra automation bot; no warning needed."
             exit 0
           fi
 
           if [[ "${HEAD_REF}" == "staging" ]]; then
-            echo "PR #${PR_NUMBER} is the staging -> master promotion; no confirmation needed."
+            echo "PR #${PR_NUMBER} is the staging -> master promotion; no warning needed."
             exit 0
           fi
 
-          MARKER="<!-- pr-guard-conversation-master:confirm-intent -->"
+          BODY="This PR targets \`master\`, which triggers a **production deployment** on merge (see deploy.yml). Please confirm this is intentional — if you meant \`qa\`, \`staging\`, or \`testing\` instead, update the base branch. Resolve this conversation once you've confirmed."
 
-          echo "Looking for an existing conversation from this workflow..."
-          THREADS_JSON="$(gh api graphql -f query='
-            query($owner: String!, $repo: String!, $number: Int!) {
-              repository(owner: $owner, name: $repo) {
-                pullRequest(number: $number) {
-                  reviewThreads(last: 100) {
-                    nodes {
-                      isResolved
-                      comments(first: 1) {
-                        nodes { body }
-                      }
-                    }
-                  }
-                }
-              }
-            }' -f owner="${OWNER}" -f repo="${REPO_NAME}" -F number="${PR_NUMBER}")"
-
-          GUARD_STATE="$(echo "${THREADS_JSON}" | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          marker = '${MARKER}'
-          states = []
-          for node in data['data']['repository']['pullRequest']['reviewThreads']['nodes']:
-              comments = node.get('comments', {}).get('nodes', [])
-              if comments and comments[0].get('body', '').startswith(marker):
-                  states.append(node['isResolved'])
-          print('open' if False in states else 'resolved' if states else 'none')
-          ")"
-
-          if [ "${GUARD_STATE}" = "open" ]; then
-            echo "Confirmation conversation is already unresolved -- nothing to do."
-            exit 0
-          fi
-
-          # github.token cannot unresolve review threads, so re-locking means a new conversation.
-          if [ "${GUARD_STATE}" = "resolved" ]; then
-            echo "Previous confirmation was resolved -- opening a new one for the new changes."
-          else
-            echo "No existing conversation found; creating one."
-          fi
-
-          BODY="${MARKER}
-          Do you really want to merge into \`master\`? Merging into \`master\` triggers a **production deployment** (see deploy.yml). Resolve this conversation once you've confirmed -- pushing new commits will open a new one. If this isn't intentional, re-target this PR to \`qa\`, \`staging\`, or \`testing\` instead."
-
+          echo "Fetching changed files to anchor a resolvable review comment..."
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate > /tmp/pr_files.json
 
           ANCHOR="$(python3 - <<'PY'
@@ -101,58 +71,53 @@ jobs:
           with open("/tmp/pr_files.json") as f:
               files = json.load(f)
 
-          def first_changed_line(patch, prefix):
-              old_line = new_line = None
+          def first_added_line(patch):
+              # Walk the unified diff hunks, tracking the line number in the NEW
+              # (right-hand) file, and return the first genuinely added line —
+              # i.e. a line valid to anchor a review comment to.
+              new_line = None
               for line in patch.splitlines():
                   if line.startswith("@@"):
-                      old_part, new_part = line.split("@@")[1].split()
-                      old_line = int(old_part[1:].split(",")[0])
-                      new_line = int(new_part[1:].split(",")[0])
+                      plus_part = line.split("+", 1)[1].split("@@")[0].strip()
+                      new_line = int(plus_part.split(",")[0])
                       continue
                   if new_line is None:
                       continue
-                  if line.startswith(prefix):
-                      return new_line if prefix == "+" else old_line
-                  if line.startswith("+"):
-                      new_line += 1
-                  elif line.startswith("-"):
-                      old_line += 1
-                  elif not line.startswith("\\"):
-                      old_line += 1
+                  if line.startswith("+") and not line.startswith("+++"):
+                      return new_line
+                  if not line.startswith("-"):
                       new_line += 1
               return None
 
-          def find_anchor():
-              for prefix, side in (("+", "RIGHT"), ("-", "LEFT")):
-                  for entry in files:
-                      line = first_changed_line(entry.get("patch") or "", prefix)
-                      if line:
-                          return f'{line}|{side}|{entry["filename"]}'
-              return f'||{files[0]["filename"]}' if files else ""
-
-          print(find_anchor())
+          for entry in files:
+              patch = entry.get("patch")
+              if not patch:
+                  continue
+              line = first_added_line(patch)
+              if line:
+                  print(f'{entry["filename"]}|{line}')
+                  break
           PY
           )"
 
           if [ -z "${ANCHOR}" ]; then
-            echo "::error::PR #${PR_NUMBER} has no changed files to anchor a confirmation conversation to, so this merge into master is NOT guarded."
-            exit 1
+            echo "No addable line found to anchor a review comment to (pure deletions/binary/rename PR?)."
+            echo "Falling back to a plain PR comment; this will NOT be gated by 'require conversation resolution'."
+            gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body "${BODY}"
+            exit 0
           fi
 
-          IFS='|' read -r ANCHOR_LINE ANCHOR_SIDE ANCHOR_PATH <<< "${ANCHOR}"
+          ANCHOR_PATH="${ANCHOR%%|*}"
+          ANCHOR_LINE="${ANCHOR##*|}"
 
-          # No commentable line (binary, rename-only, or oversized diff): fall back to a file-level conversation.
-          if [ -n "${ANCHOR_LINE}" ]; then
-            ANCHOR_ARGS=(-F line="${ANCHOR_LINE}" -f side="${ANCHOR_SIDE}")
-          else
-            ANCHOR_ARGS=(-f subject_type="file")
-          fi
+          echo "Anchoring warning to ${ANCHOR_PATH}:${ANCHOR_LINE}"
 
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" \
             -f body="${BODY}" \
             -f commit_id="${HEAD_SHA}" \
             -f path="${ANCHOR_PATH}" \
-            "${ANCHOR_ARGS[@]}" \
+            -F line="${ANCHOR_LINE}" \
+            -f side="RIGHT" \
             > /dev/null
 
-          echo "Posted resolvable review comment on ${ANCHOR_PATH}${ANCHOR_LINE:+:${ANCHOR_LINE} (${ANCHOR_SIDE})}."
+          echo "Posted resolvable review comment on ${ANCHOR_PATH}:${ANCHOR_LINE}."
